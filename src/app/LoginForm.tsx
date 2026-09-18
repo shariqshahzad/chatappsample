@@ -89,10 +89,6 @@ export default function LoginForm() {
             {loading ? "Signing in..." : "Sign in"}
           </button>
         </form>
-
-        <p className="mt-6 text-center text-xs text-slate-400">
-          Demo accounts: alice / alice123, bob / bob123
-        </p>
       </div>
     </div>
   );

@@ -22,6 +22,94 @@ function isImage(type?: string) {
   return !!type && type.startsWith("image/");
 }
 
+function isAudio(type?: string) {
+  return !!type && type.startsWith("audio/");
+}
+
+function formatDuration(seconds: number) {
+  if (!isFinite(seconds) || seconds < 0) seconds = 0;
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function VoicePlayer({ src, mine }: { src: string; mine: boolean }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+
+  const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+
+  function togglePlay() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (playing) {
+      audio.pause();
+    } else {
+      audio.play().catch(() => {});
+    }
+  }
+
+  function seek(e: React.MouseEvent<HTMLDivElement>) {
+    const audio = audioRef.current;
+    if (!audio || !duration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    audio.currentTime = ratio * duration;
+    setCurrentTime(audio.currentTime);
+  }
+
+  const barColor = mine ? "bg-white/40" : "bg-slate-300 dark:bg-slate-600";
+  const fillColor = mine ? "bg-white" : "bg-blue-500";
+  const btnColor = mine
+    ? "bg-white/20 hover:bg-white/30 text-white"
+    : "bg-blue-100 hover:bg-blue-200 text-blue-600 dark:bg-slate-700 dark:hover:bg-slate-600 dark:text-blue-400";
+  const timeColor = mine ? "text-blue-100" : "text-slate-400";
+
+  return (
+    <div className="mt-1 flex w-full min-w-[220px] max-w-[320px] items-center gap-2 sm:max-w-[380px]">
+      <audio
+        ref={audioRef}
+        src={src}
+        preload="metadata"
+        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+        onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
+        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => {
+          setPlaying(false);
+          setCurrentTime(0);
+        }}
+        className="hidden"
+      />
+      <button
+        type="button"
+        onClick={togglePlay}
+        className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-base transition ${btnColor}`}
+        title={playing ? "Pause" : "Play"}
+      >
+        {playing ? "⏸" : "▶"}
+      </button>
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div
+          onClick={seek}
+          className={`h-1.5 w-full cursor-pointer rounded-full ${barColor}`}
+        >
+          <div
+            className={`h-1.5 rounded-full ${fillColor}`}
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+        <span className={`text-[10px] tabular-nums ${timeColor}`}>
+          {formatDuration(playing || currentTime > 0 ? currentTime : duration)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function ChatClient({ currentUser, peerUser }: Props) {
   const router = useRouter();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -29,6 +117,12 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recordError, setRecordError] = useState<string | null>(null);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordStreamRef = useRef<MediaStream | null>(null);
 
   const lastIdRef = useRef<string | null>(null);
   const pollingRef = useRef(false);
@@ -79,6 +173,13 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
+  useEffect(() => {
+    return () => {
+      mediaRecorderRef.current?.stop();
+      recordStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = text.trim();
@@ -103,14 +204,12 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
     }
   }
 
-  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  async function uploadFile(file: File | Blob, fileName: string) {
     setUploading(true);
     setError(null);
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("file", file, fileName);
       const res = await fetch("/api/upload", {
         method: "POST",
         body: formData,
@@ -123,8 +222,75 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
       await poll();
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      await uploadFile(file, file.name);
+    } finally {
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
+  }
+
+  function pickRecordingMimeType() {
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4",
+      "audio/ogg;codecs=opus",
+    ];
+    for (const type of candidates) {
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return "";
+  }
+
+  async function startRecording() {
+    setRecordError(null);
+    if (typeof window === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setRecordError("Voice recording is not supported in this browser");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordStreamRef.current = stream;
+      const mimeType = pickRecordingMimeType();
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        recordStreamRef.current = null;
+        const blob = new Blob(recordedChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        recordedChunksRef.current = [];
+        if (blob.size > 0) {
+          const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
+          await uploadFile(blob, `voice-note-${Date.now()}.${ext}`);
+        }
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setRecording(true);
+    } catch {
+      setRecordError("Microphone permission denied or unavailable");
+    }
+  }
+
+  function stopRecording() {
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+    setRecording(false);
   }
 
   async function handleLogout() {
@@ -193,6 +359,8 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                         className="mt-1 max-h-72 w-full rounded-lg object-cover"
                       />
                     </a>
+                  ) : isAudio(m.mediaType) ? (
+                    <VoicePlayer src={`/api/media/${m.mediaId}`} mine={mine} />
                   ) : (
                     <a
                       href={`/api/media/${m.mediaId}`}
@@ -203,6 +371,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                       }`}
                     >
                       📎 {m.mediaName || "Download file"}
+
                     </a>
                   ))}
                 <p
@@ -221,6 +390,9 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
 
       {error && (
         <p className="px-4 pb-1 text-center text-xs text-red-500">{error}</p>
+      )}
+      {recordError && (
+        <p className="px-4 pb-1 text-center text-xs text-red-500">{recordError}</p>
       )}
 
       {/* Composer */}
@@ -243,6 +415,18 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
         >
           {uploading ? "⏳" : "📎"}
         </label>
+        <button
+          type="button"
+          onClick={recording ? stopRecording : startRecording}
+          className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full text-xl transition ${
+            recording
+              ? "animate-pulse bg-red-500 text-white hover:bg-red-600"
+              : "bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700"
+          }`}
+          title={recording ? "Stop recording" : "Record voice note"}
+        >
+          {recording ? "⏹️" : "🎤"}
+        </button>
         <input
           type="text"
           value={text}
