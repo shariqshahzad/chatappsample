@@ -39,22 +39,54 @@ function VoicePlayer({ src, mine }: { src: string; mine: boolean }) {
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [loadError, setLoadError] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+  const progress = duration > 0 && isFinite(duration) ? (currentTime / duration) * 100 : 0;
 
-  function togglePlay() {
+  // Chrome/Android MediaRecorder blobs sometimes report duration=Infinity
+  // until the audio is seeked once. Work around it so the progress bar and
+  // time display work correctly.
+  function fixInfiniteDuration(audio: HTMLAudioElement) {
+    if (audio.duration === Infinity || isNaN(audio.duration)) {
+      const onTimeUpdate = () => {
+        audio.removeEventListener("timeupdate", onTimeUpdate);
+        audio.currentTime = 0;
+        setDuration(audio.duration && isFinite(audio.duration) ? audio.duration : 0);
+      };
+      audio.addEventListener("timeupdate", onTimeUpdate);
+      audio.currentTime = 1e101;
+    } else {
+      setDuration(audio.duration || 0);
+    }
+  }
+
+  async function togglePlay() {
     const audio = audioRef.current;
     if (!audio) return;
     if (playing) {
       audio.pause();
-    } else {
-      audio.play().catch(() => {});
+      return;
+    }
+    setLoadError(false);
+    setLoading(true);
+    try {
+      // Ensure the element is ready to play; helps some mobile browsers
+      // that need an explicit load() before play() after being idle.
+      if (audio.readyState < 2) {
+        audio.load();
+      }
+      await audio.play();
+    } catch {
+      setLoadError(true);
+    } finally {
+      setLoading(false);
     }
   }
 
   function seek(e: React.MouseEvent<HTMLDivElement>) {
     const audio = audioRef.current;
-    if (!audio || !duration) return;
+    if (!audio || !duration || !isFinite(duration)) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
     audio.currentTime = ratio * duration;
@@ -74,11 +106,20 @@ function VoicePlayer({ src, mine }: { src: string; mine: boolean }) {
         ref={audioRef}
         src={src}
         preload="metadata"
-        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
-        onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
+        playsInline
+        onLoadedMetadata={(e) => fixInfiniteDuration(e.currentTarget)}
+        onDurationChange={(e) => {
+          if (isFinite(e.currentTarget.duration)) {
+            setDuration(e.currentTarget.duration || 0);
+          }
+        }}
         onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
+        onError={() => {
+          setLoadError(true);
+          setPlaying(false);
+        }}
         onEnded={() => {
           setPlaying(false);
           setCurrentTime(0);
@@ -88,10 +129,11 @@ function VoicePlayer({ src, mine }: { src: string; mine: boolean }) {
       <button
         type="button"
         onClick={togglePlay}
-        className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-base transition ${btnColor}`}
-        title={playing ? "Pause" : "Play"}
+        disabled={loading}
+        className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-base transition disabled:opacity-60 ${btnColor}`}
+        title={loadError ? "Tap to retry" : playing ? "Pause" : "Play"}
       >
-        {playing ? "⏸" : "▶"}
+        {loading ? "⏳" : loadError ? "🔄" : playing ? "⏸" : "▶"}
       </button>
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         <div
@@ -104,12 +146,15 @@ function VoicePlayer({ src, mine }: { src: string; mine: boolean }) {
           />
         </div>
         <span className={`text-[10px] tabular-nums ${timeColor}`}>
-          {formatDuration(playing || currentTime > 0 ? currentTime : duration)}
+          {loadError
+            ? "Couldn't play — tap to retry"
+            : formatDuration(playing || currentTime > 0 ? currentTime : duration)}
         </span>
       </div>
     </div>
   );
 }
+
 
 export default function ChatClient({ currentUser, peerUser }: Props) {
   const router = useRouter();
@@ -122,19 +167,33 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
   const [recordError, setRecordError] = useState<string | null>(null);
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [openReactionFor, setOpenReactionFor] = useState<string | null>(null);
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [peerTyping, setPeerTyping] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordStreamRef = useRef<MediaStream | null>(null);
+  const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
   const lastIdRef = useRef<string | null>(null);
   const updatedSinceRef = useRef<number>(0);
   const pollingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isTypingRef = useRef(false);
 
   const scrollToBottom = useCallback(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, []);
+
+  const scrollToMessage = useCallback((id: string) => {
+    const el = messageRefs.current.get(id);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightedId(id);
+      setTimeout(() => setHighlightedId((cur) => (cur === id ? null : cur)), 1500);
+    }
   }, []);
 
   const poll = useCallback(async () => {
@@ -194,6 +253,27 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
   }, [poll]);
 
   useEffect(() => {
+    let cancelled = false;
+    async function pollTyping() {
+      try {
+        const res = await fetch("/api/typing");
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled) setPeerTyping(!!data.typing);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    pollTyping();
+    const interval = setInterval(pollTyping, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
@@ -201,8 +281,35 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
     return () => {
       mediaRecorderRef.current?.stop();
       recordStreamRef.current?.getTracks().forEach((t) => t.stop());
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      if (isTypingRef.current) {
+        fetch("/api/typing", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ typing: false }),
+        }).catch(() => {});
+      }
     };
   }, []);
+
+  function sendTypingSignal(typing: boolean) {
+    if (typing === isTypingRef.current) return;
+    isTypingRef.current = typing;
+    fetch("/api/typing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ typing }),
+    }).catch(() => {});
+  }
+
+  function handleTextChange(e: React.ChangeEvent<HTMLInputElement>) {
+    setText(e.target.value);
+    sendTypingSignal(true);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      sendTypingSignal(false);
+    }, 2000);
+  }
 
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
@@ -210,6 +317,8 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
     if (!trimmed || sending) return;
     setSending(true);
     setError(null);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    sendTypingSignal(false);
     try {
       const res = await fetch("/api/messages", {
         method: "POST",
@@ -389,7 +498,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
               }`}
             >
               {mine && (
-                <div className="flex flex-shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100">
+                <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                   <button
                     type="button"
                     onClick={() => setOpenReactionFor(openReactionFor === m.id ? null : m.id)}
@@ -408,7 +517,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                   </button>
                 </div>
               )}
-              <div className="relative max-w-[80%] sm:max-w-[60%]">
+              <div className="relative min-w-0 max-w-[70%] sm:max-w-[60%]">
                 {openReactionFor === m.id && (
                   <div
                     className={`absolute -top-10 z-10 flex gap-1 rounded-full border border-slate-200 bg-white px-2 py-1 shadow-lg dark:border-slate-700 dark:bg-slate-800 ${
@@ -430,15 +539,24 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                   </div>
                 )}
                 <div
-                  className={`rounded-2xl px-4 py-2 shadow ${
+                  className={`rounded-2xl px-4 py-2 shadow transition-colors duration-500 ${
+                    highlightedId === m.id
+                      ? "ring-2 ring-yellow-400"
+                      : ""
+                  } ${
                     mine
                       ? "rounded-br-sm bg-blue-600 text-white"
                       : "rounded-bl-sm bg-white text-slate-800 dark:bg-slate-800 dark:text-slate-100"
                   }`}
+                  ref={(el) => {
+                    if (el) messageRefs.current.set(m.id, el);
+                    else messageRefs.current.delete(m.id);
+                  }}
                 >
                   {m.replyPreview && (
                     <div
-                      className={`mb-1.5 rounded-lg border-l-4 px-2 py-1 text-xs ${
+                      onClick={() => m.replyToId && scrollToMessage(m.replyToId)}
+                      className={`mb-1.5 cursor-pointer rounded-lg border-l-4 px-2 py-1 text-xs transition hover:brightness-95 ${
                         mine
                           ? "border-blue-300 bg-blue-700/50 text-blue-100"
                           : "border-blue-400 bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300"
@@ -513,7 +631,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                 )}
               </div>
               {!mine && (
-                <div className="flex flex-shrink-0 items-center gap-1 opacity-0 transition group-hover:opacity-100">
+                <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                   <button
                     type="button"
                     onClick={() => setReplyTarget(m)}
@@ -571,6 +689,17 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
         </div>
       )}
 
+      {peerTyping && (
+        <p className="flex items-center gap-1.5 border-t border-slate-200 bg-white px-4 py-1.5 text-xs font-medium text-blue-500 dark:border-slate-800 dark:bg-slate-900 dark:text-blue-400">
+          <span className="flex gap-0.5">
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-500 [animation-delay:-0.3s] dark:bg-blue-400" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-500 [animation-delay:-0.15s] dark:bg-blue-400" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-blue-500 dark:bg-blue-400" />
+          </span>
+          {peerUser} is typing...
+        </p>
+      )}
+
       {/* Composer */}
       <form
         onSubmit={handleSend}
@@ -606,7 +735,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
         <input
           type="text"
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={handleTextChange}
           placeholder="Type a message..."
           className="min-w-0 flex-1 rounded-full border border-slate-300 px-4 py-2 text-base outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 dark:border-slate-600 dark:bg-slate-800 dark:text-white"
         />

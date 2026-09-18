@@ -41,6 +41,7 @@ export const MEDIA_TTL_MS = 10 * 60 * 1000; // 10 minutes
 type Store = {
   messages: ChatMessage[];
   media: Map<string, MediaEntry>;
+  typing: Map<string, number>; // username -> timestamp of last typing signal
   cleanupTimer?: ReturnType<typeof setInterval>;
 };
 
@@ -50,6 +51,7 @@ function createStore(): Store {
   const store: Store = {
     messages: [],
     media: new Map(),
+    typing: new Map(),
   };
 
   store.cleanupTimer = setInterval(() => {
@@ -154,4 +156,24 @@ export function getMedia(id: string): MediaEntry | undefined {
     return undefined;
   }
   return entry;
+}
+
+export const TYPING_TTL_MS = 4000; // consider "typing" stale after 4s of silence
+
+export function setTyping(username: string) {
+  store.typing.set(username, Date.now());
+}
+
+export function clearTyping(username: string) {
+  store.typing.delete(username);
+}
+
+export function isTyping(username: string): boolean {
+  const ts = store.typing.get(username);
+  if (!ts) return false;
+  if (Date.now() - ts > TYPING_TTL_MS) {
+    store.typing.delete(username);
+    return false;
+  }
+  return true;
 }
