@@ -31,6 +31,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   const lastIdRef = useRef<string | null>(null);
+  const pollingRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -39,6 +40,8 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
   }, []);
 
   const poll = useCallback(async () => {
+    if (pollingRef.current) return; // avoid overlapping requests causing dupes
+    pollingRef.current = true;
     try {
       const url = lastIdRef.current
         ? `/api/messages?after=${lastIdRef.current}`
@@ -52,13 +55,17 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
       const incoming: ChatMessage[] = data.messages ?? [];
       if (incoming.length > 0) {
         setMessages((prev) => {
-          const merged = lastIdRef.current ? [...prev, ...incoming] : incoming;
-          return merged;
+          const seen = new Set(prev.map((m) => m.id));
+          const deduped = incoming.filter((m) => !seen.has(m.id));
+          if (deduped.length === 0) return prev;
+          return lastIdRef.current ? [...prev, ...deduped] : deduped;
         });
         lastIdRef.current = incoming[incoming.length - 1].id;
       }
     } catch {
       // Ignore transient network errors; next poll will retry.
+    } finally {
+      pollingRef.current = false;
     }
   }, [router]);
 
