@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
   const buffer = Buffer.from(arrayBuffer);
   const mediaId = randomUUID();
 
-  addMedia({
+  await addMedia({
     id: mediaId,
     buffer,
     contentType: file.type || "application/octet-stream",
@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
     mediaName: file.name || "upload",
     createdAt: Date.now(),
   };
-  addMessage(message);
+  await addMessage(message);
 
   return NextResponse.json({ message });
 }

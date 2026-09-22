@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const message = toggleReaction(messageId, username, emoji);
+  const message = await toggleReaction(messageId, username, emoji);
   if (!message) {
     return NextResponse.json({ error: "Message not found" }, { status: 404 });
   }

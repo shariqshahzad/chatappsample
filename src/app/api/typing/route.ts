@@ -14,7 +14,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
   const peer = otherUser(username);
-  const typing = peer ? isTyping(peer) : false;
+  const typing = peer ? await isTyping(peer) : false;
   return NextResponse.json({ typing });
 }
 
@@ -25,9 +25,9 @@ export async function POST(req: NextRequest) {
   }
   const body = await req.json().catch(() => null);
   if (body?.typing === false) {
-    clearTyping(username);
+    await clearTyping(username);
   } else {
-    setTyping(username);
+    await setTyping(username);
   }
   return NextResponse.json({ ok: true });
 }

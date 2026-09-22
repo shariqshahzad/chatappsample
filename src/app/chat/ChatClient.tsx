@@ -34,6 +34,64 @@ function formatDuration(seconds: number) {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+// Ordered longest-token-first so e.g. ":-)" is matched before ":)".
+const SMILEY_MAP: [string, string][] = [
+  [":-)))", "😄"],
+  [":')", "😂"],
+  [":'-)", "😂"],
+  [":'(", "😢"],
+  [":'-(", "😢"],
+  [":-)))", "😄"],
+  ["<3", "❤️"],
+  ["</3", "💔"],
+  [":-D", "😃"],
+  [":D", "😃"],
+  ["xD", "😆"],
+  ["XD", "😆"],
+  [":-*", "😘"],
+  [":*", "😘"],
+  [";-*", "😘"],
+  [";*", "😘"],
+  [":-P", "😛"],
+  [":P", "😛"],
+  [":-p", "😛"],
+  [":p", "😛"],
+  [":-O", "😮"],
+  [":O", "😮"],
+  [":-o", "😮"],
+  [":o", "😮"],
+  ["B-)", "😎"],
+  ["B)", "😎"],
+  [":-|", "😐"],
+  [":|", "😐"],
+  [":-/", "😕"],
+  [":/", "😕"],
+  [":-\\", "😕"],
+  [":\\", "😕"],
+  [">:(", "😠"],
+  [">:-(", "😠"],
+  [":-((", "😢"],
+  [":((", "😢"],
+  [":-(", "😢"],
+  [":(", "😢"],
+  [";-)", "😉"],
+  [";)", "😉"],
+  [":-)", "🙂"],
+  [":)", "🙂"],
+  ["o.O", "😳"],
+  ["-_-", "😑"],
+];
+
+function convertSmileys(input: string): string {
+  let result = input;
+  for (const [token, emoji] of SMILEY_MAP) {
+    // Escape regex special chars in the token.
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    result = result.split(new RegExp(escaped, "g")).join(emoji);
+  }
+  return result;
+}
+
 function VoicePlayer({ src, mine }: { src: string; mine: boolean }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
@@ -313,7 +371,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
 
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
-    const trimmed = text.trim();
+    const trimmed = convertSmileys(text.trim());
     if (!trimmed || sending) return;
     setSending(true);
     setError(null);
@@ -326,6 +384,20 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
         body: JSON.stringify({
           text: trimmed,
           replyToId: replyTarget?.id,
+          // Send the preview data we already have locally, rather than
+          // relying solely on the server being able to look up the
+          // original message (it may have scrolled out of retained
+          // history, or this request may hit a different server
+          // instance in a multi-instance deployment). This guarantees
+          // the reply quote is attached every time.
+          replyPreview: replyTarget
+            ? {
+                from: replyTarget.from,
+                text: replyTarget.text,
+                mediaType: replyTarget.mediaType,
+                mediaName: replyTarget.mediaName,
+              }
+            : undefined,
         }),
       });
       if (!res.ok) {
@@ -498,12 +570,12 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
               }`}
             >
               {mine && (
-                <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
+                <div className="flex flex-shrink-0 items-center gap-0.5 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                   <button
                     type="button"
                     onClick={() => setOpenReactionFor(openReactionFor === m.id ? null : m.id)}
                     title="React"
-                    className="rounded-full p-1.5 text-sm text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+                    className="flex h-9 w-9 touch-manipulation items-center justify-center rounded-full text-base text-slate-400 hover:bg-slate-200 active:bg-slate-300 dark:hover:bg-slate-700 dark:active:bg-slate-600"
                   >
                     😊
                   </button>
@@ -511,7 +583,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                     type="button"
                     onClick={() => setReplyTarget(m)}
                     title="Reply"
-                    className="rounded-full p-1.5 text-sm text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+                    className="flex h-9 w-9 touch-manipulation items-center justify-center rounded-full text-base text-slate-400 hover:bg-slate-200 active:bg-slate-300 dark:hover:bg-slate-700 dark:active:bg-slate-600"
                   >
                     ↩️
                   </button>
@@ -631,12 +703,12 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                 )}
               </div>
               {!mine && (
-                <div className="flex flex-shrink-0 items-center gap-1 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
+                <div className="flex flex-shrink-0 items-center gap-0.5 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
                   <button
                     type="button"
                     onClick={() => setReplyTarget(m)}
                     title="Reply"
-                    className="rounded-full p-1.5 text-sm text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+                    className="flex h-9 w-9 touch-manipulation items-center justify-center rounded-full text-base text-slate-400 hover:bg-slate-200 active:bg-slate-300 dark:hover:bg-slate-700 dark:active:bg-slate-600"
                   >
                     ↩️
                   </button>
@@ -644,7 +716,7 @@ export default function ChatClient({ currentUser, peerUser }: Props) {
                     type="button"
                     onClick={() => setOpenReactionFor(openReactionFor === m.id ? null : m.id)}
                     title="React"
-                    className="rounded-full p-1.5 text-sm text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+                    className="flex h-9 w-9 touch-manipulation items-center justify-center rounded-full text-base text-slate-400 hover:bg-slate-200 active:bg-slate-300 dark:hover:bg-slate-700 dark:active:bg-slate-600"
                   >
                     😊
                   </button>

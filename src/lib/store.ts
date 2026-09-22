@@ -1,10 +1,19 @@
-// In-memory data store for chat messages and uploaded media.
-// Everything here lives only in server memory: it resets on server restart
-// and media is automatically purged after MEDIA_TTL_MS.
+// Redis-backed data store for chat messages, uploaded media, and typing
+// presence. Replaces the previous per-instance in-memory store, which
+// caused inconsistent/duplicated/vanishing history whenever requests
+// landed on different server instances (or after hot reloads) — each
+// instance had its own separate copy of the data. Redis gives every
+// instance a single, consistent source of truth.
 //
-// We stash the store on `globalThis` so that Next.js dev-mode hot reloads
-// (which re-evaluate modules) don't wipe out existing data or start
-// duplicate cleanup timers.
+// Data layout in Redis:
+//   chat:messages:hash          HASH   id -> JSON.stringify(ChatMessage)
+//   chat:messages:index         ZSET   score=createdAt, member=id  (ordering)
+//   chat:messages:updatedIndex  ZSET   score=updatedAt, member=id (for sync)
+//   media:{id}:buf              STRING raw file bytes, TTL = MEDIA_TTL_MS
+//   media:{id}:meta             STRING JSON metadata, TTL = MEDIA_TTL_MS
+//   typing:{username}           STRING "1", TTL = TYPING_TTL_MS (presence)
+
+import { redis } from "./redis";
 
 export type ChatMessage = {
   id: string;
@@ -37,87 +46,121 @@ export type MediaEntry = {
 };
 
 export const MEDIA_TTL_MS = 10 * 60 * 1000; // 10 minutes
+export const TYPING_TTL_MS = 4000; // consider "typing" stale after 4s of silence
 
-type Store = {
-  messages: ChatMessage[];
-  media: Map<string, MediaEntry>;
-  typing: Map<string, number>; // username -> timestamp of last typing signal
-  cleanupTimer?: ReturnType<typeof setInterval>;
-};
+const MESSAGES_HASH = "chat:messages:hash";
+const MESSAGES_INDEX = "chat:messages:index";
+const MESSAGES_UPDATED_INDEX = "chat:messages:updatedIndex";
+const MAX_MESSAGES = 2000;
 
-const globalForStore = globalThis as unknown as { __chatStore?: Store };
-
-function createStore(): Store {
-  const store: Store = {
-    messages: [],
-    media: new Map(),
-    typing: new Map(),
-  };
-
-  store.cleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of store.media) {
-      if (now - entry.createdAt > MEDIA_TTL_MS) {
-        store.media.delete(id);
-      }
-    }
-  }, 30 * 1000);
-
-  return store;
+function serialize(msg: ChatMessage): string {
+  return JSON.stringify(msg);
 }
 
-export const store: Store = globalForStore.__chatStore ?? createStore();
-globalForStore.__chatStore = store;
+function deserialize(json: string): ChatMessage {
+  return JSON.parse(json) as ChatMessage;
+}
 
-export function addMessage(msg: ChatMessage) {
-  store.messages.push(msg);
+// NOTE: @upstash/redis is a REST/JSON client. Values passed to `set`/`hset`
+// are automatically JSON-serialized/deserialized by the client, so we store
+// plain strings (already JSON via our own serialize()) as-is; the client
+// will hand them back as strings since they're valid JSON strings. To avoid
+// any ambiguity/double-parsing we always serialize to a JSON string
+// ourselves and treat whatever comes back as `unknown`, coercing safely.
+
+function coerceToString(val: unknown): string | null {
+  if (val === null || val === undefined) return null;
+  if (typeof val === "string") return val;
+  // The client may auto-parse JSON strings back into objects; if so,
+  // re-stringify so our deserialize() call below works uniformly.
+  return JSON.stringify(val);
+}
+
+async function hydrateIds(ids: string[]): Promise<ChatMessage[]> {
+  if (ids.length === 0) return [];
+  const result = await redis.hmget<Record<string, unknown>>(
+    MESSAGES_HASH,
+    ...ids
+  );
+  if (!result) return [];
+  const out: ChatMessage[] = [];
+  for (const id of ids) {
+    const raw = coerceToString(result[id]);
+    if (raw) out.push(deserialize(raw));
+  }
+  return out.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+export async function addMessage(msg: ChatMessage): Promise<void> {
+  await redis.hset(MESSAGES_HASH, { [msg.id]: serialize(msg) });
+  await redis.zadd(MESSAGES_INDEX, { score: msg.createdAt, member: msg.id });
+
   // Keep memory bounded, but generous enough that long conversations
-  // don't lose history unexpectedly. Always trims from the front (oldest
-  // messages), never the newly added ones.
-  if (store.messages.length > 2000) {
-    store.messages.splice(0, store.messages.length - 2000);
+  // don't lose history unexpectedly. Always trims the oldest messages,
+  // never the newly added ones.
+  const count = await redis.zcard(MESSAGES_INDEX);
+  if (count > MAX_MESSAGES) {
+    const excess = count - MAX_MESSAGES;
+    const staleIds = await redis.zrange<string[]>(MESSAGES_INDEX, 0, excess - 1);
+    if (staleIds.length > 0) {
+      await Promise.all([
+        redis.zrem(MESSAGES_INDEX, ...staleIds),
+        redis.zrem(MESSAGES_UPDATED_INDEX, ...staleIds),
+        redis.hdel(MESSAGES_HASH, ...staleIds),
+      ]);
+    }
   }
 }
 
-export function getMessagesSince(
+export async function getMessagesSince(
   afterId: string | null,
   updatedSince?: number
-): { newMessages: ChatMessage[]; updatedMessages: ChatMessage[] } {
-  let newMessages: ChatMessage[];
+): Promise<{ newMessages: ChatMessage[]; updatedMessages: ChatMessage[] }> {
+  let newIds: string[];
+
   if (!afterId) {
-    newMessages = store.messages;
+    newIds = await redis.zrange<string[]>(MESSAGES_INDEX, 0, -1);
   } else {
-    const idx = store.messages.findIndex((m) => m.id === afterId);
-    if (idx === -1) {
-      // The reference message is gone (trimmed, or this request landed on a
-      // different in-memory instance). Returning the full list here would
-      // make already-seen messages reappear duplicated, or make the client
-      // think older messages "vanished" if this instance's history differs.
-      // Signal the caller to do a full resync instead of guessing.
-      newMessages = store.messages;
+    const rank = await redis.zrank(MESSAGES_INDEX, afterId);
+    if (rank === null || rank === undefined) {
+      // The reference message is gone (trimmed). Returning the full list
+      // here is the safest fallback — and now this is consistent across
+      // all server instances, since they all read from the same Redis
+      // store instead of divergent in-memory copies.
+      newIds = await redis.zrange<string[]>(MESSAGES_INDEX, 0, -1);
     } else {
-      newMessages = store.messages.slice(idx + 1);
+      newIds = await redis.zrange<string[]>(MESSAGES_INDEX, rank + 1, -1);
     }
   }
+
+  const newMessages = await hydrateIds(newIds);
 
   if (!updatedSince) return { newMessages, updatedMessages: [] };
 
   // Also include older messages (already delivered) that were updated
   // (e.g. a reaction was added) since the client's last poll, so those
   // updates propagate without re-sending the whole history.
-  const newIds = new Set(newMessages.map((m) => m.id));
-  const updatedMessages = store.messages.filter(
-    (m) => !newIds.has(m.id) && (m.updatedAt || 0) > updatedSince
+  const updatedIds = await redis.zrange<string[]>(
+    MESSAGES_UPDATED_INDEX,
+    `(${updatedSince}`,
+    "+inf",
+    { byScore: true }
   );
+  const newIdSet = new Set(newIds);
+  const filteredUpdatedIds = updatedIds.filter((id) => !newIdSet.has(id));
+  const updatedMessages = await hydrateIds(filteredUpdatedIds);
+
   return { newMessages, updatedMessages };
 }
 
-export function hasMessage(id: string): boolean {
-  return store.messages.some((m) => m.id === id);
+export async function hasMessage(id: string): Promise<boolean> {
+  const exists = await redis.hexists(MESSAGES_HASH, id);
+  return exists === 1;
 }
 
-export function getMessageById(id: string): ChatMessage | undefined {
-  return store.messages.find((m) => m.id === id);
+export async function getMessageById(id: string): Promise<ChatMessage | undefined> {
+  const raw = coerceToString(await redis.hget(MESSAGES_HASH, id));
+  return raw ? deserialize(raw) : undefined;
 }
 
 /**
@@ -126,13 +169,14 @@ export function getMessageById(id: string): ChatMessage | undefined {
  * different emoji, it's replaced. Returns the updated message, or
  * undefined if the message doesn't exist.
  */
-export function toggleReaction(
+export async function toggleReaction(
   messageId: string,
   username: string,
   emoji: string
-): ChatMessage | undefined {
-  const msg = store.messages.find((m) => m.id === messageId);
-  if (!msg) return undefined;
+): Promise<ChatMessage | undefined> {
+  const raw = coerceToString(await redis.hget(MESSAGES_HASH, messageId));
+  if (!raw) return undefined;
+  const msg = deserialize(raw);
   const reactions = { ...(msg.reactions || {}) };
   if (reactions[username] === emoji) {
     delete reactions[username];
@@ -141,39 +185,56 @@ export function toggleReaction(
   }
   msg.reactions = reactions;
   msg.updatedAt = Date.now();
+
+  await redis.hset(MESSAGES_HASH, { [messageId]: serialize(msg) });
+  await redis.zadd(MESSAGES_UPDATED_INDEX, {
+    score: msg.updatedAt,
+    member: messageId,
+  });
+
   return msg;
 }
 
-export function addMedia(entry: MediaEntry) {
-  store.media.set(entry.id, entry);
+export async function addMedia(entry: MediaEntry): Promise<void> {
+  const ttlMs = MEDIA_TTL_MS;
+  const meta: Omit<MediaEntry, "buffer"> = {
+    id: entry.id,
+    contentType: entry.contentType,
+    fileName: entry.fileName,
+    createdAt: entry.createdAt,
+  };
+  const base64 = entry.buffer.toString("base64");
+  await Promise.all([
+    redis.set(`media:${entry.id}:buf`, base64, { px: ttlMs }),
+    redis.set(`media:${entry.id}:meta`, JSON.stringify(meta), { px: ttlMs }),
+  ]);
 }
 
-export function getMedia(id: string): MediaEntry | undefined {
-  const entry = store.media.get(id);
-  if (!entry) return undefined;
-  if (Date.now() - entry.createdAt > MEDIA_TTL_MS) {
-    store.media.delete(id);
-    return undefined;
-  }
-  return entry;
+export async function getMedia(id: string): Promise<MediaEntry | undefined> {
+  const [bufRaw, metaRaw] = await Promise.all([
+    redis.get<string>(`media:${id}:buf`),
+    redis.get<string>(`media:${id}:meta`),
+  ]);
+  if (!bufRaw || !metaRaw) return undefined;
+  const meta = JSON.parse(
+    typeof metaRaw === "string" ? metaRaw : JSON.stringify(metaRaw)
+  ) as Omit<MediaEntry, "buffer">;
+  const buffer = Buffer.from(
+    typeof bufRaw === "string" ? bufRaw : String(bufRaw),
+    "base64"
+  );
+  return { ...meta, buffer };
 }
 
-export const TYPING_TTL_MS = 4000; // consider "typing" stale after 4s of silence
-
-export function setTyping(username: string) {
-  store.typing.set(username, Date.now());
+export async function setTyping(username: string): Promise<void> {
+  await redis.set(`typing:${username}`, "1", { px: TYPING_TTL_MS });
 }
 
-export function clearTyping(username: string) {
-  store.typing.delete(username);
+export async function clearTyping(username: string): Promise<void> {
+  await redis.del(`typing:${username}`);
 }
 
-export function isTyping(username: string): boolean {
-  const ts = store.typing.get(username);
-  if (!ts) return false;
-  if (Date.now() - ts > TYPING_TTL_MS) {
-    store.typing.delete(username);
-    return false;
-  }
-  return true;
+export async function isTyping(username: string): Promise<boolean> {
+  const exists = await redis.exists(`typing:${username}`);
+  return exists === 1;
 }
